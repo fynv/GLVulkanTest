@@ -10,10 +10,14 @@
 #include <EGL/eglext.h>
 #define GL_GLEXT_PROTOTYPES
 #include <GLES2/gl2ext.h>
+#include <unistd.h>
 #include <vector>
 #include <string>
+#include <chrono>
 #include "vulkan/vulkan.h"
 #include "vulkan/vulkan_android.h"
+
+#define ENABLE_VALIDATION 1
 
 static std::string g_vertex_blit =
 R"(#version 310 es
@@ -168,8 +172,26 @@ GLProgram::~GLProgram()
         glDeleteProgram(m_id);
 }
 
+inline uint64_t time_micro_sec()
+{
+    std::chrono::time_point<std::chrono::system_clock> tpSys = std::chrono::system_clock::now();
+    std::chrono::time_point<std::chrono::system_clock, std::chrono::microseconds> tpMicro
+            = std::chrono::time_point_cast<std::chrono::microseconds>(tpSys);
+    return tpMicro.time_since_epoch().count();
+}
+
+inline uint64_t time_milli_sec()
+{
+    return (time_micro_sec() + 500) / 1000;
+}
+
+inline double time_sec()
+{
+    return (double)time_micro_sec() / 1000000.0;
+}
 
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID pfnGetAndroidHardwareBufferProperties;
+PFN_vkImportFenceFdKHR pfnImportFenceFdKHR;
 
 class  GLVulkanTest
 {
@@ -213,8 +235,10 @@ public:
             createInfo.pApplicationInfo = &appInfo;
             createInfo.enabledExtensionCount = (uint32_t) name_extensions.size();
             createInfo.ppEnabledExtensionNames = name_extensions.data();
+#if ENABLE_VALIDATION
             createInfo.enabledLayerCount = 1;
             createInfo.ppEnabledLayerNames = validationLayers;
+#endif
             vkCreateInstance(&createInfo, nullptr, &m_instance);
         }
 
@@ -265,7 +289,7 @@ public:
             std::vector<const char*> name_extensions = {
                 VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
                 VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME,
-                VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME
+                VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME
             };
 
             VkDeviceCreateInfo createInfo = {};
@@ -289,6 +313,7 @@ public:
         }
 
         pfnGetAndroidHardwareBufferProperties = (PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(m_device, "vkGetAndroidHardwareBufferPropertiesANDROID");
+        pfnImportFenceFdKHR = (PFN_vkImportFenceFdKHR)vkGetDeviceProcAddr(m_device, "vkImportFenceFdKHR");
 
         // render pass
         {
@@ -407,6 +432,13 @@ public:
             VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
             pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
 
+            VkPushConstantRange push_constant = {};
+            push_constant.size = sizeof(float);
+            push_constant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+            pipelineLayoutInfo.pPushConstantRanges = &push_constant;
+            pipelineLayoutInfo.pushConstantRangeCount = 1;
+
             vkCreatePipelineLayout(m_device, &pipelineLayoutInfo, nullptr, &m_pipelineLayout);
 
             VkGraphicsPipelineCreateInfo pipelineInfo = {};
@@ -428,6 +460,15 @@ public:
 
         }
 
+        // fence
+        {
+            VkFenceCreateInfo fenceInfo = {};
+            fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+            vkCreateFence(m_device, &fenceInfo, nullptr, &m_frames[0].vk_fence);
+            vkCreateFence(m_device, &fenceInfo, nullptr, &m_frames[1].vk_fence);
+        }
+
         // OpenGL
         GLShader shader_blit_vert(GL_VERTEX_SHADER, g_vertex_blit.c_str());
         GLShader shader_blit_frag(GL_FRAGMENT_SHADER, g_frag_blit.c_str());
@@ -444,14 +485,31 @@ public:
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
         glBindTexture(GL_TEXTURE_2D, 0);
 
+        // fence interop
+        EGLDisplay dpy = eglGetCurrentDisplay();
+        for (int i=0; i<2; i++)
+        {
+            m_frames[i].egl_sync = eglCreateSyncKHR(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+            m_frames[i].fenceFd = eglDupNativeFenceFDANDROID(dpy, m_frames[i].egl_sync);
+
+            VkImportFenceFdInfoKHR importInfo = {};
+            importInfo.sType = VK_STRUCTURE_TYPE_IMPORT_FENCE_FD_INFO_KHR;
+            importInfo.fence =  m_frames[i].vk_fence;
+            importInfo.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
+            importInfo.fd =  m_frames[i].fenceFd;
+            pfnImportFenceFdKHR(m_device, &importInfo);
+        }
+
         init(); // initialize framebuffers and other size-dependent resources
 
     }
 
     ~GLVulkanTest()
     {
-        glDeleteTextures(1, &m_gl_color_buf);
         vkDeviceWaitIdle(m_device);
+        vkDestroyFence(m_device,  m_frames[0].vk_fence, nullptr);
+        vkDestroyFence(m_device,  m_frames[1].vk_fence, nullptr);
+
         clear();
         vkDestroyPipeline(m_device, m_pipeline, nullptr);
         vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
@@ -474,12 +532,72 @@ public:
 
     void Draw(JNIEnv* env)
     {
-        vkQueueWaitIdle(m_Queue);
+        EGLContext egl_ctx = eglGetCurrentContext();
+        if (egl_ctx == EGL_NO_CONTEXT) return;
+
+        vkWaitForFences(m_device, 1, &m_frames[m_id_frame].vk_fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(m_device,1, &m_frames[m_id_frame].vk_fence);
+
+        VkCommandBuffer cmdBuf = m_commandBuffers[m_id_frame];
+        // record command buffer
+        {
+            VkCommandBufferBeginInfo beginInfo = {};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+            vkBeginCommandBuffer(cmdBuf, &beginInfo);
+
+            VkViewport viewport;
+            viewport.x = 0;
+            viewport.y = 0;
+            viewport.width = m_width;
+            viewport.height = m_height;
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
+
+            VkRect2D scissor = {};
+            scissor.offset = { (int)0, (int)0 };
+            scissor.extent = { (unsigned)m_width, (unsigned)m_height };
+
+            vkCmdSetViewport(cmdBuf, 0, 1, &viewport);
+            vkCmdSetScissor(cmdBuf, 0, 1, &scissor);
+
+            VkRenderPassBeginInfo renderPassInfo = {};
+            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            renderPassInfo.renderPass = m_renderPass;
+            renderPassInfo.framebuffer = m_frames[m_id_frame].framebuffer;
+            renderPassInfo.renderArea.offset = { 0, 0 };
+            renderPassInfo.renderArea.extent = { (unsigned)m_width, (unsigned)m_height};
+
+            VkClearValue clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+            renderPassInfo.clearValueCount = 1;
+            renderPassInfo.pClearValues = &clearColor;
+
+            vkCmdBeginRenderPass(cmdBuf, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+            vkCmdBindPipeline(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+            vkCmdPushConstants(cmdBuf, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float), &m_move);
+            vkCmdDraw(cmdBuf, 3, 1, 0, 0);
+            vkCmdEndRenderPass(cmdBuf);
+
+            vkEndCommandBuffer(cmdBuf);
+        }
+
         VkSubmitInfo submitInfo = {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &m_commandBuffer;
-        vkQueueSubmit(m_Queue, 1, &submitInfo, VK_NULL_HANDLE);
+        submitInfo.pCommandBuffers = &cmdBuf;
+        vkQueueSubmit(m_Queue, 1, &submitInfo, m_frames[m_id_frame].vk_fence);
+
+        m_move+=m_move_step;
+        if (m_move>1.0f || m_move<-1.0f)
+        {
+            m_move_step = -m_move_step;
+            m_move += 2.0*m_move_step;
+        }
+
+
+        EGLDisplay dpy = eglGetCurrentDisplay();
+        eglWaitSync(dpy, m_frames[m_id_frame].egl_sync, 0);
 
         glViewport(0,0,m_width, m_height);
         glClearColor(1.0f,0.0f,1.0f,1.0f);
@@ -497,12 +615,16 @@ public:
         glBindTexture(GL_TEXTURE_2D, 0);
         glUseProgram(0);
 
+        m_id_frame = 1 - m_id_frame;
     }
 
 private:
     JNIEnv* m_cur_env = nullptr;
     AAssetManager* m_asset_manager = nullptr;
     std::vector<unsigned char> spv_vert, spv_frag;
+
+    float m_move = -1.0f;
+    float m_move_step = 0.01f;
 
     void load_bin(const char* filename, std::vector<unsigned char>& data)
     {
@@ -536,15 +658,24 @@ private:
     VkQueue m_Queue = VK_NULL_HANDLE;
 
     VkCommandPool m_commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
+    VkCommandBuffer m_commandBuffers[2] = {VK_NULL_HANDLE};
 
-    AHardwareBuffer* m_color_buf_ahb = nullptr;
-    VkImage m_color_buf = VK_NULL_HANDLE;
-    VkDeviceMemory m_color_buf_mem = VK_NULL_HANDLE;
-    VkImageView m_color_buf_view = VK_NULL_HANDLE;
-    VkFramebuffer m_framebuffer = VK_NULL_HANDLE;
+    struct Frame
+    {
+        AHardwareBuffer* color_buf_ahb = nullptr;
+        VkImage color_buf = VK_NULL_HANDLE;
+        VkDeviceMemory color_buf_mem = VK_NULL_HANDLE;
+        VkImageView color_buf_view = VK_NULL_HANDLE;
+        VkFramebuffer framebuffer = VK_NULL_HANDLE;
+        VkFence vk_fence = VK_NULL_HANDLE;
+        EGLImageKHR egl_color_buf = nullptr;
+        EGLSyncKHR egl_sync = nullptr;
+        int fenceFd = 0;
+    };
 
-    EGLImageKHR m_egl_color_buf = nullptr;
+    Frame m_frames[2];
+
+    int m_id_frame = 0;
 
     VkRenderPass m_renderPass;
     VkShaderModule m_vertShaderModule;
@@ -556,134 +687,143 @@ private:
     std::unique_ptr<GLProgram> m_prog_blit;
     unsigned m_gl_color_buf;
 
-
-
     void clear()
     {
-        if (m_egl_color_buf!=nullptr)
+        for (int i=0;i<2;i++)
         {
-            EGLDisplay dpy = eglGetCurrentDisplay();
-            eglDestroyImageKHR(dpy, m_egl_color_buf);
-        }
-        if (m_framebuffer !=VK_NULL_HANDLE)
-        {
-            vkDestroyFramebuffer(m_device, m_framebuffer, nullptr);
-        }
+            if (m_frames[i].egl_color_buf != nullptr)
+            {
+                if (eglGetCurrentContext() != EGL_NO_CONTEXT)
+                {
+                    EGLDisplay dpy = eglGetCurrentDisplay();
+                    eglDestroyImageKHR(dpy, m_frames[i].egl_color_buf);
+                }
+            }
 
-        if (m_color_buf!=VK_NULL_HANDLE )
-        {
-            vkDestroyImageView(m_device, m_color_buf_view, nullptr);
-            vkDestroyImage(m_device, m_color_buf, nullptr);
-            vkFreeMemory(m_device, m_color_buf_mem, nullptr);
-        }
-        if (m_color_buf_ahb != nullptr)
-        {
-            AHardwareBuffer_release(m_color_buf_ahb);
+            if (m_frames[i].framebuffer != VK_NULL_HANDLE)
+            {
+                vkDestroyFramebuffer(m_device, m_frames[i].framebuffer, nullptr);
+            }
+
+            if (m_frames[i].color_buf != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(m_device, m_frames[i].color_buf_view, nullptr);
+                vkDestroyImage(m_device, m_frames[i].color_buf, nullptr);
+                vkFreeMemory(m_device, m_frames[i].color_buf_mem, nullptr);
+            }
+
+            if (m_frames[i].color_buf_ahb != nullptr)
+            {
+                AHardwareBuffer_release(m_frames[i].color_buf_ahb);
+            }
         }
     }
 
     void init()
     {
         clear();
-        // color target
+
+        for (int i=0; i<2; i++)
         {
-            AHardwareBuffer_Desc ahb_desc = {};
-            ahb_desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
-            ahb_desc.width = m_width;
-            ahb_desc.height = m_height;
-            ahb_desc.layers = 1;
-            ahb_desc.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER;
-            AHardwareBuffer_allocate(&ahb_desc, &m_color_buf_ahb);
-
-            VkAndroidHardwareBufferFormatPropertiesANDROID formatInfo ={};
-            formatInfo.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
-
-            VkAndroidHardwareBufferPropertiesANDROID properties = {};
-            properties.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
-            properties.pNext = &formatInfo;
-            pfnGetAndroidHardwareBufferProperties(m_device, m_color_buf_ahb, &properties);
-
-            VkExternalMemoryImageCreateInfo externalCreateInfo = {};
-            externalCreateInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-            externalCreateInfo.pNext = nullptr;
-            externalCreateInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
-
-            VkImageCreateInfo imageInfo = {};
-            imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-            imageInfo.pNext = &externalCreateInfo;
-            imageInfo.imageType = VK_IMAGE_TYPE_2D;
-            imageInfo.extent.width = m_width;
-            imageInfo.extent.height = m_height;
-            imageInfo.extent.depth = 1;
-            imageInfo.mipLevels = 1;
-            imageInfo.arrayLayers = 1;
-            imageInfo.format = formatInfo.format;
-            imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-            imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            imageInfo.usage =
-                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-            imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-
-            vkCreateImage(m_device, &imageInfo, nullptr, &m_color_buf);
-
-            VkImportAndroidHardwareBufferInfoANDROID androidHardwareBufferInfo = {};
-            androidHardwareBufferInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
-            androidHardwareBufferInfo.buffer = m_color_buf_ahb;
-
-            VkMemoryDedicatedAllocateInfo memoryAllocateInfo = {};
-            memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-            memoryAllocateInfo.pNext = &androidHardwareBufferInfo;
-            memoryAllocateInfo.image = m_color_buf;
-
-            VkPhysicalDeviceMemoryProperties memProperties;
-            vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
-
-            uint32_t memoryTypeIndex = VK_MAX_MEMORY_TYPES;
-            for (uint32_t k = 0; k < memProperties.memoryTypeCount; k++)
+            // color target
             {
-                if ((properties.memoryTypeBits & (1 << k)) == 0) continue;
-                memoryTypeIndex = k;
-                break;
+                AHardwareBuffer_Desc ahb_desc = {};
+                ahb_desc.format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+                ahb_desc.width = m_width;
+                ahb_desc.height = m_height;
+                ahb_desc.layers = 1;
+                ahb_desc.usage = AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER;
+                AHardwareBuffer_allocate(&ahb_desc, &m_frames[i].color_buf_ahb);
+
+                VkAndroidHardwareBufferFormatPropertiesANDROID formatInfo = {};
+                formatInfo.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+
+                VkAndroidHardwareBufferPropertiesANDROID properties = {};
+                properties.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+                properties.pNext = &formatInfo;
+                pfnGetAndroidHardwareBufferProperties(m_device, m_frames[i].color_buf_ahb, &properties);
+
+                VkExternalMemoryImageCreateInfo externalCreateInfo = {};
+                externalCreateInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+                externalCreateInfo.pNext = nullptr;
+                externalCreateInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+                VkImageCreateInfo imageInfo = {};
+                imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+                imageInfo.pNext = &externalCreateInfo;
+                imageInfo.imageType = VK_IMAGE_TYPE_2D;
+                imageInfo.extent.width = m_width;
+                imageInfo.extent.height = m_height;
+                imageInfo.extent.depth = 1;
+                imageInfo.mipLevels = 1;
+                imageInfo.arrayLayers = 1;
+                imageInfo.format = formatInfo.format;
+                imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+                imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                imageInfo.usage =
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+                imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+                vkCreateImage(m_device, &imageInfo, nullptr, &m_frames[i].color_buf);
+
+                VkImportAndroidHardwareBufferInfoANDROID androidHardwareBufferInfo = {};
+                androidHardwareBufferInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
+                androidHardwareBufferInfo.buffer = m_frames[i].color_buf_ahb;
+
+                VkMemoryDedicatedAllocateInfo memoryAllocateInfo = {};
+                memoryAllocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+                memoryAllocateInfo.pNext = &androidHardwareBufferInfo;
+                memoryAllocateInfo.image = m_frames[i].color_buf;
+
+                VkPhysicalDeviceMemoryProperties memProperties;
+                vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memProperties);
+
+                uint32_t memoryTypeIndex = VK_MAX_MEMORY_TYPES;
+                for (uint32_t k = 0; k < memProperties.memoryTypeCount; k++) {
+                    if ((properties.memoryTypeBits & (1 << k)) == 0) continue;
+                    memoryTypeIndex = k;
+                    break;
+                }
+
+                VkMemoryAllocateInfo allocateInfo = {};
+                allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                allocateInfo.pNext = &memoryAllocateInfo;
+                allocateInfo.allocationSize = properties.allocationSize;
+                allocateInfo.memoryTypeIndex = memoryTypeIndex;
+                vkAllocateMemory(m_device, &allocateInfo, nullptr, &m_frames[i].color_buf_mem);
+                vkBindImageMemory(m_device, m_frames[i].color_buf, m_frames[i].color_buf_mem, 0);
+
+                VkImageViewCreateInfo createInfo = {};
+                createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                createInfo.image = m_frames[i].color_buf;
+                createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                createInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+                createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                createInfo.subresourceRange.baseMipLevel = 0;
+                createInfo.subresourceRange.levelCount = 1;
+                createInfo.subresourceRange.baseArrayLayer = 0;
+                createInfo.subresourceRange.layerCount = 1;
+                vkCreateImageView(m_device, &createInfo, nullptr, &m_frames[i].color_buf_view);
+
             }
 
-            VkMemoryAllocateInfo allocateInfo = {};
-            allocateInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-            allocateInfo.pNext = &memoryAllocateInfo;
-            allocateInfo.allocationSize = properties.allocationSize;
-            allocateInfo.memoryTypeIndex = memoryTypeIndex;
-            vkAllocateMemory(m_device, &allocateInfo, nullptr, &m_color_buf_mem);
-            vkBindImageMemory(m_device, m_color_buf, m_color_buf_mem, 0);
+            // framebuffer
+            {
+                VkImageView attachments[] = {m_frames[i].color_buf_view};
+                VkFramebufferCreateInfo framebufferInfo = {};
+                framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+                framebufferInfo.renderPass = m_renderPass;
+                framebufferInfo.attachmentCount = 1;
+                framebufferInfo.pAttachments = attachments;
+                framebufferInfo.width = m_width;
+                framebufferInfo.height = m_height;
+                framebufferInfo.layers = 1;
 
-            VkImageViewCreateInfo createInfo = {};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = m_color_buf;
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            createInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-            vkCreateImageView(m_device, &createInfo, nullptr, &m_color_buf_view);
-
-        }
-
-        // framebuffer
-        {
-            VkImageView attachments[] = { m_color_buf_view };
-            VkFramebufferCreateInfo framebufferInfo = {};
-            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-            framebufferInfo.renderPass = m_renderPass;
-            framebufferInfo.attachmentCount = 1;
-            framebufferInfo.pAttachments = attachments;
-            framebufferInfo.width = m_width;
-            framebufferInfo.height = m_height;
-            framebufferInfo.layers = 1;
-
-            vkCreateFramebuffer(m_device, &framebufferInfo, nullptr, &m_framebuffer);
+                vkCreateFramebuffer(m_device, &framebufferInfo, nullptr, &m_frames[i].framebuffer);
+            }
         }
 
         // command buffer
@@ -692,62 +832,27 @@ private:
             allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
             allocInfo.commandPool = m_commandPool;
             allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-            vkAllocateCommandBuffers(m_device, &allocInfo, &m_commandBuffer);
+            allocInfo.commandBufferCount = 2;
+            vkAllocateCommandBuffers(m_device, &allocInfo, m_commandBuffers);
         }
 
-        // record command buffer
+        for (int i=0; i<2; i++)
         {
-            VkCommandBufferBeginInfo beginInfo = {};
-            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            //EGL
+            EGLDisplay dpy = eglGetCurrentDisplay();
+            EGLint attrs[] = {
+                    EGL_IMAGE_PRESERVED_KHR, EGL_TRUE,
+                    EGL_NONE,
+            };
+            m_frames[i].egl_color_buf = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
+                                                eglGetNativeClientBufferANDROID(m_frames[i].color_buf_ahb),
+                                                attrs);
 
-            vkBeginCommandBuffer(m_commandBuffer, &beginInfo);
-
-            VkViewport viewport;
-            viewport.x = 0;
-            viewport.y = 0;
-            viewport.width = m_width;
-            viewport.height = m_height;
-            viewport.minDepth = 0.0f;
-            viewport.maxDepth = 1.0f;
-
-            VkRect2D scissor = {};
-            scissor.offset = { (int)0, (int)0 };
-            scissor.extent = { (unsigned)m_width, (unsigned)m_height };
-
-            vkCmdSetViewport(m_commandBuffer, 0, 1, &viewport);
-            vkCmdSetScissor(m_commandBuffer, 0, 1, &scissor);
-
-            VkRenderPassBeginInfo renderPassInfo = {};
-            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            renderPassInfo.renderPass = m_renderPass;
-            renderPassInfo.framebuffer = m_framebuffer;
-            renderPassInfo.renderArea.offset = { 0, 0 };
-            renderPassInfo.renderArea.extent = { (unsigned)m_width, (unsigned)m_height};
-
-            VkClearValue clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
-            renderPassInfo.clearValueCount = 1;
-            renderPassInfo.pClearValues = &clearColor;
-
-            vkCmdBeginRenderPass(m_commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-            vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
-            vkCmdDraw(m_commandBuffer, 3, 1, 0, 0);
-            vkCmdEndRenderPass(m_commandBuffer);
-
-            vkEndCommandBuffer(m_commandBuffer);
+            glBindTexture(GL_TEXTURE_2D, m_gl_color_buf);
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_frames[i].egl_color_buf);
+            glBindTexture(GL_TEXTURE_2D, 0);
         }
 
-        //EGL
-        EGLDisplay dpy = eglGetCurrentDisplay();
-        EGLint attrs[] = {
-                EGL_IMAGE_PRESERVED_KHR,    EGL_TRUE,
-                EGL_NONE,
-        };
-        m_egl_color_buf = eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, eglGetNativeClientBufferANDROID(m_color_buf_ahb), attrs);
-
-        glBindTexture(GL_TEXTURE_2D, m_gl_color_buf);
-        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_egl_color_buf);
-        glBindTexture(GL_TEXTURE_2D, 0);
     }
 
 };
